@@ -1,6 +1,6 @@
 --!nocheck
 --=====================================================================
---  AIM ASSIST + ANTI-CHEAT  —  arquivo único
+--  AIM ASSIST + ANTI-CHEAT  —  arquivo único (loadstring)
 --
 --  INSTALAÇÃO:
 --   1. Game Settings > Security > Allow HTTP Requests = true
@@ -8,12 +8,23 @@
 --   3. Script no ServerScriptService com:
 --      loadstring(game:HttpGet("SUA_URL_RAW"))()
 --
+--  PLATAFORMAS: PC (mouse+clique) | Console (centro+R2) | Mobile (toque+botão FIRE)
+--  Mobile com teclado/mouse pareado também funciona (vira modo mouse).
+--
+--  FOV = área de aquisição (0 a 100 graus de raio). Desenhado na tela.
+--  Mostrar/esconder: tecla F, ou _G.AimAssist.setFov(true/false)
+--  Tamanho em runtime: _G.AimAssist.setFovSize(0..100)
+--
 --  A mira gruda no inimigo mais próximo. Não atira sozinha,
 --  não mexe na câmera e não mexe no movimento do personagem.
---  PC = mouse | Mobile = toque + botão FIRE | Controle = centro + R2
 --=====================================================================
 
-local VERSION = "1.0.0"
+-- a URL TEM que ser a mesma do loadstring de cima
+local URL = "https://raw.githubusercontent.com/Solutionszz/Solutioms/refs/heads/main/aimassist"
+
+local FOLDER_NAME = "AimAssist"
+local REMOTE_NAME = "AimAssistFire"
+local CLIENT_NAME = "AimAssistClient"
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -21,252 +32,543 @@ local RunService        = game:GetService("RunService")
 local Workspace         = game:GetService("Workspace")
 
 --=====================================================================
---  CONFIG  (única fonte da verdade — vai pro cliente automaticamente)
+--  LADO CLIENTE
+--=====================================================================
+if RunService:IsClient() then
+	local UserInputService = game:GetService("UserInputService")
+
+	local Folder = ReplicatedStorage:WaitForChild(FOLDER_NAME)
+	local Remote = Folder:WaitForChild(REMOTE_NAME)
+
+	-- espera a CONFIG chegar do servidor
+	repeat task.wait() until Folder:GetAttribute("FOV") ~= nil
+
+	local CONFIG = {}
+	for k, v in pairs(Folder:GetAttributes()) do
+		CONFIG[k] = v
+	end
+
+	local player = Players.LocalPlayer
+	local camera = Workspace.CurrentCamera
+
+	local CONE = math.rad(math.clamp(CONFIG.FOV, 0, 100))
+	local SNAP = math.rad(CONFIG.SnapAngleDeg)
+
+	local LOCK_COLOR = Color3.fromRGB(255, 90, 90)
+	local FREE_COLOR = Color3.fromRGB(255, 255, 255)
+	local FOV_COLOR  = Color3.fromRGB(120, 200, 255)
+
+	local function angleBetween(a, b)
+		local d = math.clamp(a.Unit:Dot(b.Unit), -1, 1)
+		return math.acos(d)
+	end
+
+	local function blend(raw, targetDir, angle)
+		if angle <= SNAP then return targetDir.Unit end
+		local f = math.clamp((CONE - angle) / math.max(CONE - SNAP, 1e-4), 0, 1)
+		f = CONFIG.MinBlend + (1 - CONFIG.MinBlend) * f
+		return raw.Lerp(targetDir, f).Unit
+	end
+
+	local function rotateTowards(from, to, maxRad)
+		local a = angleBetween(from, to)
+		if a <= maxRad or a < 1e-6 then return to.Unit end
+		local axis = from.Unit:Cross(to.Unit)
+		if axis.Magnitude < 1e-6 then return to.Unit end
+		return (CFrame.fromAxisAngle(axis.Unit, maxRad) * from.Unit).Unit
+	end
+
+	local function rotateBy(from, to, vec)
+		local a = angleBetween(from, to)
+		if a < 1e-6 then return vec.Unit end
+		local axis = from.Unit:Cross(to.Unit)
+		if axis.Magnitude < 1e-6 then return vec.Unit end
+		return (CFrame.fromAxisAngle(axis.Unit, a) * vec).Unit
+	end
+
+	local function initialKind()
+		if UserInputService.KeyboardEnabled then return "mouse" end
+		if UserInputService.TouchEnabled then return "touch" end
+		if UserInputService.GamepadEnabled then return "gamepad" end
+		return "mouse"
+	end
+
+	local function isGamepad(t)
+		return t.Name:match("^Gamepad") ~= nil
+	end
+
+	local function isMouse(t)
+		return t.Name:match("^Mouse") ~= nil
+	end
+
+	-- estado
+	local inputKind = initialKind()
+	local touchAim  = nil
+	local lastFire  = 0
+	local assistedDir, prevRaw
+	local curOrigin, curRaw, curFinal, curTarget
+	local hasTarget = false
+	local showFov   = CONFIG.ShowFov and true or false
+
+	-- GUI
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "AimAssistUI"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 100
+	gui.Parent = player:WaitForChild("PlayerGui")
+
+	-- círculo do FOV (área de aquisição, centrado na mira crua)
+	local fovRing = Instance.new("Frame")
+	fovRing.AnchorPoint = Vector2.new(0.5, 0.5)
+	fovRing.BackgroundTransparency = 1
+	fovRing.Visible = false
+	fovRing.ZIndex = 0
+	fovRing.Parent = gui
+
+	local fovStroke = Instance.new("UIStroke")
+	fovStroke.Thickness = 1.5
+	fovStroke.Color = FOV_COLOR
+	fovStroke.Transparency = 0.4
+	fovStroke.Parent = fovRing
+
+	local fovCorner = Instance.new("UICorner")
+	fovCorner.CornerRadius = UDim.new(1, 0)
+	fovCorner.Parent = fovRing
+
+	local crosshair = Instance.new("Frame")
+	crosshair.AnchorPoint = Vector2.new(0.5, 0.5)
+	crosshair.Size = UDim2.fromOffset(26, 26)
+	crosshair.BackgroundTransparency = 1
+	crosshair.Visible = false
+	crosshair.ZIndex = 2
+	crosshair.Parent = gui
+
+	local ring = Instance.new("Frame")
+	ring.Size = UDim2.fromScale(1, 1)
+	ring.BackgroundTransparency = 1
+	ring.Parent = crosshair
+
+	local ringStroke = Instance.new("UIStroke")
+	ringStroke.Thickness = 2
+	ringStroke.Color = FREE_COLOR
+	ringStroke.Transparency = 0.25
+	ringStroke.Parent = ring
+
+	local ringCorner = Instance.new("UICorner")
+	ringCorner.CornerRadius = UDim.new(1, 0)
+	ringCorner.Parent = ring
+
+	local dot = Instance.new("Frame")
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromScale(0.5, 0.5)
+	dot.Size = UDim2.fromOffset(4, 4)
+	dot.BackgroundColor3 = LOCK_COLOR
+	dot.Visible = false
+	dot.Parent = crosshair
+
+	local fireBtn = Instance.new("TextButton")
+	fireBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+	fireBtn.Position = UDim2.new(1, -90, 1, -210)
+	fireBtn.Size = UDim2.fromOffset(90, 90)
+	fireBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
+	fireBtn.BackgroundTransparency = 0.35
+	fireBtn.TextColor3 = Color3.new(1, 1, 1)
+	fireBtn.TextSize = 20
+	fireBtn.Font = Enum.Font.GothamBold
+	fireBtn.Text = "FIRE"
+	fireBtn.Parent = gui
+
+	local btnCorner = Instance.new("UICorner")
+	btnCorner.CornerRadius = UDim.new(1, 0)
+	btnCorner.Parent = fireBtn
+
+	--=========================
+	--  FOV: mostrar / esconder / tamanho
+	--=========================
+	local function setFovVisible(on)
+		showFov = on and true or false
+		fovRing.Visible = showFov
+	end
+
+	local function toggleFov()
+		setFovVisible(not showFov)
+	end
+
+	local function setFovSize(n)
+		CONFIG.FOV = math.clamp(tonumber(n) or CONFIG.FOV, 0, 100)
+		CONE = math.rad(CONFIG.FOV)
+	end
+
+	-- expõe pra fora (loadstring não tem require)
+	_G.AimAssist = _G.AimAssist or {}
+	_G.AimAssist.setFov     = setFovVisible
+	_G.AimAssist.toggleFov  = toggleFov
+	_G.AimAssist.setFovSize = setFovSize
+
+	local toggleKey
+	if typeof(CONFIG.FovToggleKey) == "string" then
+		pcall(function() toggleKey = Enum.KeyCode[CONFIG.FovToggleKey] end)
+	end
+
+	-- busca de alvo: mais próximo em ângulo, no cone, com linha de visão
+	local losParams = RaycastParams.new()
+	losParams.FilterType = Enum.RaycastFilterType.Exclude
+
+	local function findTarget(origin, rawDir, char)
+		losParams.FilterDescendantsInstances = { char }
+		local best, bestAngle = nil, CONE
+
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other ~= player and not (CONFIG.TeamCheck and other.Team == player.Team) then
+				local oc = other.Character
+				local hum = oc and oc:FindFirstChildOfClass("Humanoid")
+				local part = oc and (oc:FindFirstChild("Head") or oc:FindFirstChild("HumanoidRootPart"))
+				if hum and hum.Health > 0 and part then
+					local delta = part.Position - origin
+					local dist = delta.Magnitude
+					if dist > 1 and dist <= CONFIG.MaxDistance then
+						local ang = angleBetween(rawDir, delta)
+						if ang < bestAngle then
+							if CONFIG.RequireLineOfSight then
+								local hit = Workspace:Raycast(origin, delta, losParams)
+								if hit and not hit.Instance:IsDescendantOf(oc) then
+									continue
+								end
+							end
+							best, bestAngle = part, ang
+						end
+					end
+				end
+			end
+		end
+		return best
+	end
+
+	local function tryFire()
+		local now = os.clock()
+		if now - lastFire < CONFIG.FireCooldown then return end
+		if not (curOrigin and curRaw and curFinal) then return end
+		lastFire = now
+		Remote:FireServer(curOrigin, curRaw, curFinal, curTarget)
+	end
+
+	-- entrada
+	local function applyKind()
+		fireBtn.Visible = UserInputService.TouchEnabled and inputKind ~= "gamepad"
+		UserInputService.MouseIconEnabled = false
+	end
+
+	local function setKind(kind)
+		if inputKind == kind then return end
+		inputKind = kind
+		applyKind()
+	end
+
+	applyKind()
+
+	UserInputService.LastInputTypeChanged:Connect(function(t)
+		if isGamepad(t) then
+			setKind("gamepad")
+		elseif t == Enum.UserInputType.Touch then
+			setKind("touch")
+		elseif isMouse(t) then
+			setKind("mouse")
+		end
+	end)
+
+	UserInputService.InputBegan:Connect(function(input, gpe)
+		local t = input.UserInputType
+
+		-- atalho de FOV
+		if not gpe and toggleKey and input.KeyCode == toggleKey
+			and not UserInputService:GetFocusedTextBox() then
+			toggleFov()
+		end
+
+		if isGamepad(t) then
+			setKind("gamepad")
+		elseif t == Enum.UserInputType.Touch then
+			setKind("touch")
+			if not gpe then touchAim = Vector2.new(input.Position.X, input.Position.Y) end
+		elseif isMouse(t) then
+			setKind("mouse")
+		end
+
+		if input.KeyCode == Enum.KeyCode.ButtonR2 then
+			if not gpe or not UserInputService:GetFocusedTextBox() then
+				tryFire()
+			end
+		elseif t == Enum.UserInputType.MouseButton1 and not gpe then
+			tryFire()
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input, gpe)
+		if input.UserInputType == Enum.UserInputType.Touch and not gpe then
+			touchAim = Vector2.new(input.Position.X, input.Position.Y)
+		end
+	end)
+
+	fireBtn.MouseButton1Down:Connect(tryFire)
+
+	-- loop principal
+	RunService.RenderStepped:Connect(function(dt)
+		camera = Workspace.CurrentCamera
+		if not camera then return end
+
+		local char = player.Character
+		if not (char and char:FindFirstChild("Head")) then
+			crosshair.Visible = false
+			fovRing.Visible = false
+			curFinal = nil
+			return
+		end
+
+		-- origem e direção crua conforme a plataforma
+		local origin, rawDir
+		if inputKind == "gamepad" then
+			origin, rawDir = camera.CFrame.Position, camera.CFrame.LookVector
+		elseif inputKind == "touch" then
+			if not touchAim then touchAim = camera.ViewportSize * 0.5 end
+			local ray = camera:ScreenPointToRay(touchAim.X, touchAim.Y)
+			origin, rawDir = ray.Origin, ray.Direction
+		else
+			local loc = UserInputService:GetMouseLocation()
+			local ray = camera:ScreenPointToRay(loc.X, loc.Y)
+			origin, rawDir = ray.Origin, ray.Direction
+		end
+		rawDir = rawDir.Unit
+
+		-- círculo do FOV: raio em pixels = focal * tan(cone)
+		if showFov then
+			local rp, rOn = camera:WorldToViewportPoint(origin + rawDir * 1000)
+			if rOn then
+				local focal = (camera.ViewportSize.Y * 0.5)
+					/ math.tan(math.rad(camera.FieldOfView) * 0.5)
+				local r = focal * math.tan(CONE)
+				fovRing.Position = UDim2.fromOffset(rp.X, rp.Y)
+				fovRing.Size = UDim2.fromOffset(r * 2, r * 2)
+				fovRing.Visible = true
+			else
+				fovRing.Visible = false
+			end
+		else
+			fovRing.Visible = false
+		end
+
+		-- aquisição de alvo
+		local target = findTarget(origin, rawDir, char)
+		curOrigin, curRaw, curTarget = origin, rawDir, target
+
+		local want = rawDir
+		hasTarget = false
+		if target then
+			local targetDir = (target.Position - origin).Unit
+			local ang = angleBetween(rawDir, targetDir)
+			if ang <= CONE then
+				want = blend(rawDir, targetDir, ang)
+				hasTarget = true
+			end
+		end
+
+		if assistedDir and hasTarget then
+			assistedDir = rotateTowards(assistedDir, want, math.rad(CONFIG.AssistTurnRateDeg) * dt)
+		else
+			assistedDir = want
+		end
+
+		curFinal = rotateBy(prevRaw or rawDir, rawDir, assistedDir).Unit
+		prevRaw = rawDir
+
+		local sp, onScreen = camera:WorldToViewportPoint(origin + curFinal * 1000)
+		if onScreen then
+			crosshair.Position = UDim2.fromOffset(sp.X, sp.Y)
+			crosshair.Visible = true
+			dot.Visible = hasTarget
+			ringStroke.Color = hasTarget and LOCK_COLOR or FREE_COLOR
+			ringStroke.Transparency = hasTarget and 0.0 or 0.25
+		else
+			crosshair.Visible = false
+		end
+	end)
+
+	return
+end
+
+--=====================================================================
+--  LADO SERVIDOR
 --=====================================================================
 local CONFIG = {
 	-- aquisição de alvo
 	MaxDistance        = 250,    -- studs: alcance do grude
-	MaxAngleDeg        = 35,     -- cone de aquisição
+	FOV                = 35,     -- 0..100: raio do cone (área de aquisição)
 	SnapAngleDeg       = 6,      -- dentro disto, trava 100%
-	MinBlend           = 0.30,   -- correção mínima na borda do cone
+	MinBlend           = 0.30,   -- correção mínima na borda do FOV
 	AssistTurnRateDeg  = 22,     -- graus/s: velocidade de giro da correção
 	TeamCheck          = true,
 	RequireLineOfSight = true,
 	FireCooldown       = 0.10,
 
+	-- FOV visual
+	ShowFov            = true,
+	FovToggleKey       = "F",
+
 	-- anti-cheat (servidor)
 	AntiCheat          = true,
-	Tolerance          = 1.25,   -- folga geral (lag / jitter)
-	OriginSlack        = 14,     -- studs de folga origem cliente vs. cabeça
-	MaxTurnRateDeg     = 600,    -- graus/s: teto de giro da mira
-	DivergenceDeg      = 3,      -- tolerância vs. o assist recalculado
+	Tolerance          = 1.25,
+	OriginSlack        = 20,
+	MaxTurnRateDeg     = 600,
+	DivergenceDeg      = 5,
 	MaxSuspicion       = 6,
-	SuspicionDecay     = 1,      -- suspeitas perdidas por segundo
+	SuspicionDecay     = 1,
 	FlagInterval       = 0.2,
-	KickOnSuspicion    = false,  -- DESLIGADO por padrão
+	KickOnSuspicion    = false,
 	Verbose            = false,
 
-	FolderName         = "AimAssist",
-	RemoteName         = "AimAssistFire",
-	ClientName         = "AimAssistClient",
+	FolderName         = FOLDER_NAME,
+	RemoteName         = REMOTE_NAME,
+	ClientName         = CLIENT_NAME,
 }
 
+local Folder = ReplicatedStorage:FindFirstChild(FOLDER_NAME)
+if not Folder then
+	Folder = Instance.new("Folder")
+	Folder.Name = FOLDER_NAME
+	Folder.Parent = ReplicatedStorage
+end
+
+for k, v in pairs(CONFIG) do
+	Folder:SetAttribute(k, v)
+end
+
+local Remote = Folder:FindFirstChild(REMOTE_NAME)
+if not Remote then
+	Remote = Instance.new("RemoteEvent")
+	Remote.Name = REMOTE_NAME
+	Remote.Parent = Folder
+end
+
+local LOADER = ("loadstring(game:HttpGet(%q))()"):format(URL)
+
+local function inject(player)
+	local pg = player:WaitForChild("PlayerGui")
+	local old = pg:FindFirstChild(CLIENT_NAME)
+	if old then old:Destroy() end
+
+	local ls = Instance.new("LocalScript")
+	ls.Name = CLIENT_NAME
+	ls.Source = LOADER
+	ls.Parent = pg
+end
+
+Players.PlayerAdded:Connect(inject)
+for _, p in ipairs(Players:GetPlayers()) do
+	inject(p)
+end
+
 --=====================================================================
---  CÓDIGO DO CLIENTE (injetado como LocalScript em cada jogador)
+--  ANTI-CHEAT (servidor)
 --=====================================================================
-local CLIENT_TEMPLATE = [==[
---!nocheck
-local CONFIG = __CONFIG__
-
-local Players           = game:GetService("Players")
-local RunService        = game:GetService("RunService")
-local UserInputService  = game:GetService("UserInputService")
-local Workspace         = game:GetService("Workspace")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
-local Remote = ReplicatedStorage:WaitForChild(CONFIG.FolderName):WaitForChild(CONFIG.RemoteName)
-
-local player = Players.LocalPlayer
-local mouse  = player:GetMouse()
-local camera = Workspace.CurrentCamera
-
-local SNAP = math.rad(CONFIG.SnapAngleDeg)
-local CONE = math.rad(CONFIG.MaxAngleDeg)
+local suspicion, lastSeen, lastFlag = {}, {}, {}
 
 local function angleBetween(a, b)
 	local d = math.clamp(a.Unit:Dot(b.Unit), -1, 1)
 	return math.acos(d)
 end
 
-local function blend(raw, targetDir, angle)
-	if angle <= SNAP then return targetDir.Unit end
-	local f = math.clamp((CONE - angle) / math.max(CONE - SNAP, 1e-4), 0, 1)
-	f = CONFIG.MinBlend + (1 - CONFIG.MinBlend) * f
-	return raw.Lerp(targetDir, f).Unit
+local function headPos(player)
+	local char = player.Character
+	local head = char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+	return head and head.Position
 end
 
-local function rotateTowards(from, to, maxRad)
-	local a = angleBetween(from, to)
-	if a <= maxRad or a < 1e-6 then return to.Unit end
-	local axis = from.Unit:Cross(to.Unit)
-	if axis.Magnitude < 1e-6 then return to.Unit end
-	return (CFrame.fromAxisAngle(axis.Unit, maxRad) * from.Unit).Unit
+local function flag(player, reason)
+	local now = os.clock()
+	if now - (lastFlag[player] or 0) < CONFIG.FlagInterval then return end
+	lastFlag[player] = now
+	suspicion[player] = (suspicion[player] or 0) + 1
+
+	if CONFIG.Verbose then
+		warn(("[AimAssist] %s suspeito (%s) -> %d"):format(player.Name, reason, suspicion[player]))
+	end
+	if CONFIG.KickOnSuspicion and suspicion[player] >= CONFIG.MaxSuspicion then
+		player:Kick("Aim assist suspeito: " .. reason)
+	end
 end
 
-local function rotateBy(from, to, vec)
-	local a = angleBetween(from, to)
-	if a < 1e-6 then return vec.Unit end
-	local axis = from.Unit:Cross(to.Unit)
-	if axis.Magnitude < 1e-6 then return vec.Unit end
-	return (CFrame.fromAxisAngle(axis.Unit, a) * vec).Unit
-end
+local function validate(player, origin, rawDir, finalDir, target)
+	local head = headPos(player)
+	if not head then return true end
 
--- estado
-local inputKind = "mouse"          -- mouse | touch | gamepad
-local touchAim  = Vector2.new(0, 0)
-local lastFire  = 0
-local assistedDir, prevRaw
-local curOrigin, curRaw, curFinal, curTarget
+	local slack = math.max(CONFIG.OriginSlack, player.CameraMaxZoomDistance + 5)
+	if (origin - head).Magnitude > slack then
+		return false, "origem"
+	end
 
--- GUI
-local gui = Instance.new("ScreenGui")
-gui.Name = "AimAssistUI"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.DisplayOrder = 100
-gui.Parent = player:WaitForChild("PlayerGui")
+	if math.abs(rawDir.Magnitude - 1) > 0.05 or math.abs(finalDir.Magnitude - 1) > 0.05 then
+		return false, "normalização"
+	end
 
-local crosshair = Instance.new("Frame")
-crosshair.AnchorPoint = Vector2.new(0.5, 0.5)
-crosshair.Size = UDim2.fromOffset(26, 26)
-crosshair.BackgroundTransparency = 1
-crosshair.Visible = false
-crosshair.Parent = gui
+	if typeof(target) == "Instance" and target.Parent then
+		local delta = target.Position - origin
+		local dist = delta.Magnitude
 
-local ring = Instance.new("Frame")
-ring.Size = UDim2.fromScale(1, 1)
-ring.BackgroundTransparency = 1
-ring.Parent = crosshair
+		if dist > CONFIG.MaxDistance * CONFIG.Tolerance then
+			return false, "distância"
+		end
 
-local ringStroke = Instance.new("UIStroke")
-ringStroke.Thickness = 2
-ringStroke.Color = Color3.new(1, 1, 1)
-ringStroke.Transparency = 0.15
-ringStroke.Parent = ring
+		local fov = math.deg(angleBetween(rawDir, delta))
+		if fov > CONFIG.FOV * CONFIG.Tolerance then
+			return false, "campo de visão"
+		end
 
-local ringCorner = Instance.new("UICorner")
-ringCorner.CornerRadius = UDim.new(1, 0)
-ringCorner.Parent = ring
-
-local dot = Instance.new("Frame")
-dot.AnchorPoint = Vector2.new(0.5, 0.5)
-dot.Position = UDim2.fromScale(0.5, 0.5)
-dot.Size = UDim2.fromOffset(4, 4)
-dot.BackgroundColor3 = Color3.fromRGB(255, 90, 90)
-dot.Visible = false
-dot.Parent = crosshair
-
-local fireBtn = Instance.new("TextButton")
-fireBtn.AnchorPoint = Vector2.new(0.5, 0.5)
-fireBtn.Position = UDim2.new(1, -110, 1, -110)
-fireBtn.Size = UDim2.fromOffset(96, 96)
-fireBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
-fireBtn.BackgroundTransparency = 0.35
-fireBtn.TextColor3 = Color3.new(1, 1, 1)
-fireBtn.TextSize = 20
-fireBtn.Font = Enum.Font.GothamBold
-fireBtn.Text = "FIRE"
-fireBtn.Visible = false
-fireBtn.Parent = gui
-
-local btnCorner = Instance.new("UICorner")
-btnCorner.CornerRadius = UDim.new(1, 0)
-btnCorner.Parent = fireBtn
-
--- busca de alvo: mais próximo em ângulo, no cone, com linha de visão
-local losParams = RaycastParams.new()
-losParams.FilterType = Enum.RaycastFilterType.Exclude
-
-local function findTarget(origin, rawDir, char)
-	losParams.FilterDescendantsInstances = { char }
-	local best, bestAngle = nil, CONE
-
-	for _, other in ipairs(Players:GetPlayers()) do
-		if other ~= player and not (CONFIG.TeamCheck and other.Team == player.Team) then
-			local oc = other.Character
-			local hum = oc and oc:FindFirstChildOfClass("Humanoid")
-			local part = oc and (oc:FindFirstChild("Head") or oc:FindFirstChild("HumanoidRootPart"))
-			if hum and hum.Health > 0 and part then
-				local delta = part.Position - origin
-				local dist = delta.Magnitude
-				if dist > 1 and dist <= CONFIG.MaxDistance then
-					local ang = angleBetween(rawDir, delta)
-					if ang < bestAngle then
-						if CONFIG.RequireLineOfSight then
-							local hit = Workspace:Raycast(origin, delta, losParams)
-							if hit and not hit.Instance:IsDescendantOf(oc) then
-								continue
-							end
-						end
-						best, bestAngle = part, ang
-					end
-				end
-			end
+		local err = math.deg(angleBetween(finalDir, delta))
+		if err > CONFIG.DivergenceDeg * CONFIG.Tolerance then
+			return false, "divergência"
 		end
 	end
-	return best
-end
 
--- tiro (a mira não atira sozinha)
-local function tryFire()
 	local now = os.clock()
-	if now - lastFire < CONFIG.FireCooldown then return end
-	if not (curOrigin and curRaw and curFinal) then return end
-	lastFire = now
-	Remote:FireServer(curOrigin, curRaw, curFinal, curTarget)
+	local prev = lastSeen[player]
+	if prev then
+		local dt = math.max(now - prev.t, 1e-3)
+		local delta = math.deg(angleBetween(prev.dir, finalDir))
+		if delta / dt > CONFIG.MaxTurnRateDeg * CONFIG.Tolerance then
+			return false, "giro"
+		end
+	end
+	lastSeen[player] = { t = now, dir = finalDir }
+
+	return true
 end
 
--- entrada
-local function setKind(kind)
-	inputKind = kind
-	fireBtn.Visible = (kind == "touch")
-end
+Remote.OnServerEvent:Connect(function(player, origin, rawDir, finalDir, target)
+	if not CONFIG.AntiCheat then return end
 
-UserInputService.LastInputTypeChanged:Connect(function(t)
-	if t == Enum.UserInputType.Touch then
-		setKind("touch")
-	elseif t == Enum.UserInputType.Gamepad1 then
-		setKind("gamepad")
-	elseif t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.MouseButton1 then
-		setKind("mouse")
-	end
-end)
-
-UserInputService.InputBegan:Connect(function(input, gpe)
-	if input.UserInputType == Enum.UserInputType.Touch then
-		setKind("touch")
-		if not gpe then touchAim = Vector2.new(input.Position.X, input.Position.Y) end
-	elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
-		setKind("gamepad")
-	elseif input.UserInputType == Enum.UserInputType.MouseMovement then
-		setKind("mouse")
-	end
-
-	if gpe then return end
-	if input.UserInputType == Enum.UserInputType.MouseButton1 then
-		tryFire()
-	elseif input.KeyCode == Enum.KeyCode.ButtonR2 then
-		tryFire()
-	end
-end)
-
-UserInputService.InputChanged:Connect(function(input, gpe)
-	if input.UserInputType == Enum.UserInputType.Touch and not gpe then
-		touchAim = Vector2.new(input.Position.X, input.Position.Y)
-	end
-end)
-
-fireBtn.MouseButton1Down:Connect(tryFire)
-
--- loop principal
-RunService.RenderStepped:Connect(function(dt)
-	camera = Workspace.CurrentCamera
-	if not camera then return end
-
-	local char = player.Character
-	if not (char and char:FindFirstChild("Head")) then
-		crosshair.Visible = false
-		curFinal = nil
+	if typeof(origin) ~= "Vector3"
+		or typeof(rawDir) ~= "Vector3"
+		or typeof(finalDir) ~= "Vector3" then
+		flag(player, "dados")
 		return
 	end
 
-	-- origem e direção crua conforme a plataforma
-	local origin, rawDir
-	if inputKind == "gamepad" then
-		origin, rawDir = camera.CFrame.Position, camera.CFrame.LookVector
-	elseif inputKind == "touch" then
-		local ray = camera:ViewportPointToRay(touchAim.X, touchAim.Y)
-		origin, rawDir = ray.Origin, ray.Direction
-	else
-		local ray = mouse.UnitRay
-		origin, rawDir = ray
+	local ok, reason = validate(player, origin, rawDir, finalDir, target)
+	if not ok then
+		flag(player, reason)
+	end
+end)
+
+task.spawn(function()
+	while task.wait(1) do
+		for pl, s in pairs(suspicion) do
+			suspicion[pl] = math.max(0, s - CONFIG.SuspicionDecay)
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	suspicion[p] = nil
+	lastSeen[p] = nil
+	lastFlag[p] = nil
+end)
