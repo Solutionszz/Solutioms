@@ -1,0 +1,272 @@
+--!nocheck
+--=====================================================================
+--  AIM ASSIST + ANTI-CHEAT  —  arquivo único
+--
+--  INSTALAÇÃO:
+--   1. Game Settings > Security > Allow HTTP Requests = true
+--   2. Command bar: game:GetService("ServerScriptService").LoadStringEnabled = true
+--   3. Script no ServerScriptService com:
+--      loadstring(game:HttpGet("SUA_URL_RAW"))()
+--
+--  A mira gruda no inimigo mais próximo. Não atira sozinha,
+--  não mexe na câmera e não mexe no movimento do personagem.
+--  PC = mouse | Mobile = toque + botão FIRE | Controle = centro + R2
+--=====================================================================
+
+local VERSION = "1.0.0"
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local Workspace         = game:GetService("Workspace")
+
+--=====================================================================
+--  CONFIG  (única fonte da verdade — vai pro cliente automaticamente)
+--=====================================================================
+local CONFIG = {
+	-- aquisição de alvo
+	MaxDistance        = 250,    -- studs: alcance do grude
+	MaxAngleDeg        = 35,     -- cone de aquisição
+	SnapAngleDeg       = 6,      -- dentro disto, trava 100%
+	MinBlend           = 0.30,   -- correção mínima na borda do cone
+	AssistTurnRateDeg  = 22,     -- graus/s: velocidade de giro da correção
+	TeamCheck          = true,
+	RequireLineOfSight = true,
+	FireCooldown       = 0.10,
+
+	-- anti-cheat (servidor)
+	AntiCheat          = true,
+	Tolerance          = 1.25,   -- folga geral (lag / jitter)
+	OriginSlack        = 14,     -- studs de folga origem cliente vs. cabeça
+	MaxTurnRateDeg     = 600,    -- graus/s: teto de giro da mira
+	DivergenceDeg      = 3,      -- tolerância vs. o assist recalculado
+	MaxSuspicion       = 6,
+	SuspicionDecay     = 1,      -- suspeitas perdidas por segundo
+	FlagInterval       = 0.2,
+	KickOnSuspicion    = false,  -- DESLIGADO por padrão
+	Verbose            = false,
+
+	FolderName         = "AimAssist",
+	RemoteName         = "AimAssistFire",
+	ClientName         = "AimAssistClient",
+}
+
+--=====================================================================
+--  CÓDIGO DO CLIENTE (injetado como LocalScript em cada jogador)
+--=====================================================================
+local CLIENT_TEMPLATE = [==[
+--!nocheck
+local CONFIG = __CONFIG__
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local Workspace         = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Remote = ReplicatedStorage:WaitForChild(CONFIG.FolderName):WaitForChild(CONFIG.RemoteName)
+
+local player = Players.LocalPlayer
+local mouse  = player:GetMouse()
+local camera = Workspace.CurrentCamera
+
+local SNAP = math.rad(CONFIG.SnapAngleDeg)
+local CONE = math.rad(CONFIG.MaxAngleDeg)
+
+local function angleBetween(a, b)
+	local d = math.clamp(a.Unit:Dot(b.Unit), -1, 1)
+	return math.acos(d)
+end
+
+local function blend(raw, targetDir, angle)
+	if angle <= SNAP then return targetDir.Unit end
+	local f = math.clamp((CONE - angle) / math.max(CONE - SNAP, 1e-4), 0, 1)
+	f = CONFIG.MinBlend + (1 - CONFIG.MinBlend) * f
+	return raw.Lerp(targetDir, f).Unit
+end
+
+local function rotateTowards(from, to, maxRad)
+	local a = angleBetween(from, to)
+	if a <= maxRad or a < 1e-6 then return to.Unit end
+	local axis = from.Unit:Cross(to.Unit)
+	if axis.Magnitude < 1e-6 then return to.Unit end
+	return (CFrame.fromAxisAngle(axis.Unit, maxRad) * from.Unit).Unit
+end
+
+local function rotateBy(from, to, vec)
+	local a = angleBetween(from, to)
+	if a < 1e-6 then return vec.Unit end
+	local axis = from.Unit:Cross(to.Unit)
+	if axis.Magnitude < 1e-6 then return vec.Unit end
+	return (CFrame.fromAxisAngle(axis.Unit, a) * vec).Unit
+end
+
+-- estado
+local inputKind = "mouse"          -- mouse | touch | gamepad
+local touchAim  = Vector2.new(0, 0)
+local lastFire  = 0
+local assistedDir, prevRaw
+local curOrigin, curRaw, curFinal, curTarget
+
+-- GUI
+local gui = Instance.new("ScreenGui")
+gui.Name = "AimAssistUI"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 100
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local crosshair = Instance.new("Frame")
+crosshair.AnchorPoint = Vector2.new(0.5, 0.5)
+crosshair.Size = UDim2.fromOffset(26, 26)
+crosshair.BackgroundTransparency = 1
+crosshair.Visible = false
+crosshair.Parent = gui
+
+local ring = Instance.new("Frame")
+ring.Size = UDim2.fromScale(1, 1)
+ring.BackgroundTransparency = 1
+ring.Parent = crosshair
+
+local ringStroke = Instance.new("UIStroke")
+ringStroke.Thickness = 2
+ringStroke.Color = Color3.new(1, 1, 1)
+ringStroke.Transparency = 0.15
+ringStroke.Parent = ring
+
+local ringCorner = Instance.new("UICorner")
+ringCorner.CornerRadius = UDim.new(1, 0)
+ringCorner.Parent = ring
+
+local dot = Instance.new("Frame")
+dot.AnchorPoint = Vector2.new(0.5, 0.5)
+dot.Position = UDim2.fromScale(0.5, 0.5)
+dot.Size = UDim2.fromOffset(4, 4)
+dot.BackgroundColor3 = Color3.fromRGB(255, 90, 90)
+dot.Visible = false
+dot.Parent = crosshair
+
+local fireBtn = Instance.new("TextButton")
+fireBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+fireBtn.Position = UDim2.new(1, -110, 1, -110)
+fireBtn.Size = UDim2.fromOffset(96, 96)
+fireBtn.BackgroundColor3 = Color3.fromRGB(25, 25, 28)
+fireBtn.BackgroundTransparency = 0.35
+fireBtn.TextColor3 = Color3.new(1, 1, 1)
+fireBtn.TextSize = 20
+fireBtn.Font = Enum.Font.GothamBold
+fireBtn.Text = "FIRE"
+fireBtn.Visible = false
+fireBtn.Parent = gui
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(1, 0)
+btnCorner.Parent = fireBtn
+
+-- busca de alvo: mais próximo em ângulo, no cone, com linha de visão
+local losParams = RaycastParams.new()
+losParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local function findTarget(origin, rawDir, char)
+	losParams.FilterDescendantsInstances = { char }
+	local best, bestAngle = nil, CONE
+
+	for _, other in ipairs(Players:GetPlayers()) do
+		if other ~= player and not (CONFIG.TeamCheck and other.Team == player.Team) then
+			local oc = other.Character
+			local hum = oc and oc:FindFirstChildOfClass("Humanoid")
+			local part = oc and (oc:FindFirstChild("Head") or oc:FindFirstChild("HumanoidRootPart"))
+			if hum and hum.Health > 0 and part then
+				local delta = part.Position - origin
+				local dist = delta.Magnitude
+				if dist > 1 and dist <= CONFIG.MaxDistance then
+					local ang = angleBetween(rawDir, delta)
+					if ang < bestAngle then
+						if CONFIG.RequireLineOfSight then
+							local hit = Workspace:Raycast(origin, delta, losParams)
+							if hit and not hit.Instance:IsDescendantOf(oc) then
+								continue
+							end
+						end
+						best, bestAngle = part, ang
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- tiro (a mira não atira sozinha)
+local function tryFire()
+	local now = os.clock()
+	if now - lastFire < CONFIG.FireCooldown then return end
+	if not (curOrigin and curRaw and curFinal) then return end
+	lastFire = now
+	Remote:FireServer(curOrigin, curRaw, curFinal, curTarget)
+end
+
+-- entrada
+local function setKind(kind)
+	inputKind = kind
+	fireBtn.Visible = (kind == "touch")
+end
+
+UserInputService.LastInputTypeChanged:Connect(function(t)
+	if t == Enum.UserInputType.Touch then
+		setKind("touch")
+	elseif t == Enum.UserInputType.Gamepad1 then
+		setKind("gamepad")
+	elseif t == Enum.UserInputType.MouseMovement or t == Enum.UserInputType.MouseButton1 then
+		setKind("mouse")
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if input.UserInputType == Enum.UserInputType.Touch then
+		setKind("touch")
+		if not gpe then touchAim = Vector2.new(input.Position.X, input.Position.Y) end
+	elseif input.UserInputType == Enum.UserInputType.Gamepad1 then
+		setKind("gamepad")
+	elseif input.UserInputType == Enum.UserInputType.MouseMovement then
+		setKind("mouse")
+	end
+
+	if gpe then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		tryFire()
+	elseif input.KeyCode == Enum.KeyCode.ButtonR2 then
+		tryFire()
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input, gpe)
+	if input.UserInputType == Enum.UserInputType.Touch and not gpe then
+		touchAim = Vector2.new(input.Position.X, input.Position.Y)
+	end
+end)
+
+fireBtn.MouseButton1Down:Connect(tryFire)
+
+-- loop principal
+RunService.RenderStepped:Connect(function(dt)
+	camera = Workspace.CurrentCamera
+	if not camera then return end
+
+	local char = player.Character
+	if not (char and char:FindFirstChild("Head")) then
+		crosshair.Visible = false
+		curFinal = nil
+		return
+	end
+
+	-- origem e direção crua conforme a plataforma
+	local origin, rawDir
+	if inputKind == "gamepad" then
+		origin, rawDir = camera.CFrame.Position, camera.CFrame.LookVector
+	elseif inputKind == "touch" then
+		local ray = camera:ViewportPointToRay(touchAim.X, touchAim.Y)
+		origin, rawDir = ray.Origin, ray.Direction
+	else
+		local ray = mouse.UnitRay
+		origin, rawDir = ray
